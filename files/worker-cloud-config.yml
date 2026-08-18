@@ -1,0 +1,75 @@
+#cloud-config
+# k3s worker (agent) bootstrap
+#
+# Template variables. This list is the whole interface; anything not here is
+# not passed. Written $${...}, the templatefile() escape for a literal: a bare
+# $${...} in a comment is a real interpolation, not documentation.
+#   $${hostname}:    e.g. k3s-wkr-1
+#   $${ip}:          e.g. 10.0.0.32
+#   $${token}:       pre-generated k3s cluster token
+#   $${server_url}:  "https://10.0.0.16:6443"
+#   $${ssh_key}:     SSH public key
+#   $${k3s_version}: exact k3s release, never a channel
+
+hostname: ${hostname}
+fqdn: ${hostname}.internal
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_key}
+    lock_passwd: true
+
+# Deliberately NOT package_upgrade. A dist-upgrade at first boot pulls a
+# different package set every day, which is the same reproducibility hole as
+# an unpinned k3s, and it is most of the build time. Image updates come from
+# bumping ubuntu_codename and rebuilding templates.
+package_update: true
+package_upgrade: false
+
+packages:
+  - qemu-guest-agent
+  - curl
+  - avahi-daemon # advertise ${hostname}.local over mDNS
+  - libnss-mdns  # ...and resolve other .local names from this node
+  - open-iscsi   # Longhorn attaches its volumes over iSCSI
+
+write_files:
+  - path: /etc/rancher/k3s/config.yaml
+    permissions: "0600"
+    content: |
+      token: "${token}"
+      server: ${server_url}
+      node-ip: ${ip}
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  # The package ships iscsid socket-activated, which does not reliably bring
+  # the daemon up for Longhorn's nsenter'd iscsiadm calls. Enable the service.
+  - systemctl enable --now iscsid
+  # Pin mDNS to the LAN NIC. Left unrestricted, avahi also publishes on the
+  # k3s CNI/flannel/veth interfaces, so ${hostname}.local would resolve to a
+  # pod-network IP as often as ${ip}, and every pod churn spams the log.
+  - LAN_NIC=$(ip -o -4 route show default | awk '{print $5}' | head -1); sed -i "s/^#*allow-interfaces=.*/allow-interfaces=$LAN_NIC/" /etc/avahi/avahi-daemon.conf
+  - systemctl enable --now avahi-daemon
+  - systemctl restart avahi-daemon
+  - |
+    # Wait for at least one control-plane node to be healthy
+    # Any HTTP response means the API server is listening. /livez requires auth
+    # and returns 401, so the old `grep -q ok` never matched and every node
+    # waited the full 300s. %%{...} is escaped for templatefile().
+    for i in $(seq 1 30); do
+      if [ "$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 ${server_url}/livez 2>/dev/null)" != "000" ]; then
+        break
+      fi
+      sleep 10
+    done
+  - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${k3s_version}" INSTALL_K3S_EXEC="agent --config /etc/rancher/k3s/config.yaml" sh -
+
+power_state:
+  mode: reboot
+  message: "Cloud-init complete; rebooting"
+  timeout: 60

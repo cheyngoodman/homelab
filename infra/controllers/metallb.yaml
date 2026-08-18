@@ -1,0 +1,37 @@
+# MetalLB, installed by Flux as a HelmRelease with values committed here,
+# never a --set flag, which is how the frrk8s decision stays visible and
+# stays made. Why MetalLB at all: KUBERNETES.md.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metallb-system
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: metallb
+  namespace: metallb-system
+spec:
+  interval: 1h
+  url: https://metallb.github.io/metallb
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: metallb
+  namespace: metallb-system
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: metallb
+      version: 0.16.1
+      sourceRef:
+        kind: HelmRepository
+        name: metallb
+  values:
+    # L2 mode only; the FRR-K8s BGP machinery is a second routing daemon this
+    # flat /24 has no use for.
+    frrk8s:
+      enabled: false

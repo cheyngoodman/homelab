@@ -1,0 +1,47 @@
+# Agent-managed sites: one cert, one wildcard route. Caddy serves
+# *.hermes.lab.cheyn.net from /opt/data/Caddyfile, which also holds the auth
+# gate -- a site block without `import auth` is public.
+
+# Second-level wildcard cert (Cloudflare DNS-01, one issuance). Lives here, not
+# kube-system, because the Ingress below references it.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-hermes-lab-cheyn-net
+  namespace: hermes
+spec:
+  secretName: wildcard-hermes-lab-cheyn-net-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - "*.hermes.lab.cheyn.net"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes-web
+  namespace: hermes
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - "*.hermes.lab.cheyn.net"
+      secretName: wildcard-hermes-lab-cheyn-net-tls
+  rules:
+    - host: "*.hermes.lab.cheyn.net"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hermes
+                port:
+                  name: web

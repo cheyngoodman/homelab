@@ -1,0 +1,26 @@
+# cp terraform.tfvars.example terraform.tfvars, then fill in what you need.
+#
+# Every value below is optional to tofu and required by the layer that reads
+# it. An empty value is skipped, so a partial file still builds a cluster and
+# that layer sits NotReady. Each link is where to go get it.
+#
+# Everything else has a working default in variables.tf. Override there, not here.
+
+# Workstation SSH into the nodes -- NETWORK.md#ssh-access
+# ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZ..."
+
+# Tofu into Proxmox -- PROXMOX.md#api-token
+# proxmox_api_token = "root@pam!tofu=<the-secret>"
+# proxmox_username  = "root@pam!tofu"
+
+# Flux's deploy key, generated and registered by tofu -- KUBERNETES.md#deploy-key
+# Prefer the environment, so the token never lands in a file:
+#   export TF_VAR_github_token="$(gh auth token)"
+# github_token = "gho_..."
+
+# cert-manager into Cloudflare DNS-01 -- NETWORK.md#cloudflare-token
+# cloudflare_api_token = "..."
+
+# Tailscale operator into the tailnet -- NETWORK.md#tailscale-oauth-client
+# tailscale_oauth_client_id     = "..."
+# tailscale_oauth_client_secret = "..."

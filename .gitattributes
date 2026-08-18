@@ -1,0 +1,10 @@
+# This repo's output is consumed by Linux: cloud-init YAML is read off disk by
+# templatefile() and uploaded as user-data. A CRLF checkout would put carriage
+# returns into runcmd lines, which fail on the guest as $'\r': command not found.
+# Nothing here needs CRLF, so normalize everything to LF on checkout.
+* text=auto eol=lf
+
+# Binary-ish artifacts that must never be line-ending converted.
+*.img binary
+*.qcow2 binary
+*.png binary

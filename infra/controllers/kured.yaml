@@ -1,0 +1,40 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: kured
+  namespace: kube-system
+spec:
+  interval: 1h
+  url: https://kubereboot.github.io/charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kured
+  namespace: kube-system
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: kured
+      version: 6.1.0
+      sourceRef:
+        kind: HelmRepository
+        name: kured
+  values:
+    configuration:
+      period: 1h
+      startTime: "07:00"
+      endTime: "10:00"
+      timeZone: Etc/UTC
+      concurrency: 1
+    # The chart hardcodes control-plane and master tolerations whenever
+    # .Values.tolerations is empty, so the taint does not keep kured off the
+    # control planes. This affinity is what does.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: DoesNotExist

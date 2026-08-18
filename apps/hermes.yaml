@@ -1,0 +1,296 @@
+# The agent's namespace. Setup, endpoints and checks: HERMES.md. The QNAP
+# /hermes export is the one prerequisite outside this repo; without it the pod
+# cannot mount /opt/data and the whole apps Kustomization sits NotReady.
+#
+# What this file owns is the shape: namespace, storage, and the two routes
+# that split by port. The wildcard route and its cert are hermes-web.yaml.
+# What runs inside any of it is the agent's, on the NAS, and never in git.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hermes
+---
+# Static PV, not a StorageClass: this export is reached from outside the
+# cluster too, so the path has to be predictable rather than a
+# provisioner-generated pvc-<uuid>.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: hermes-nfs
+spec:
+  capacity:
+    storage: 100Gi # advisory; NFS enforces no quota
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    # v4 carries locking in-protocol; v3 needs statd, which is the unreliable
+    # part from inside a container.
+    - nfsvers=4.1
+    - hard
+    - noatime
+  csi:
+    driver: nfs.csi.k8s.io
+    volumeHandle: qnap-hermes-nfs
+    volumeAttributes:
+      server: 10.0.0.10
+      share: /hermes
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-nfs
+  namespace: hermes
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: hermes-nfs
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes
+  namespace: hermes
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # two pods on one SQLite database is the corruption case
+  selector:
+    matchLabels:
+      app: hermes
+  template:
+    metadata:
+      labels:
+        app: hermes
+    spec:
+      # Default is 300s. That is the dominant term in how long a dead worker
+      # keeps Hermes down, and there is one replica to wait for.
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 15
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 15
+      # No securityContext, unlike whoami.yaml. Verified: runAsUser: 1000 makes
+      # stage2 abort with "container started with --user 1000 (an arbitrary,
+      # non-hermes UID)" and the pod never starts. The image bootstraps as root
+      # and drops to HERMES_UID itself; that is the supported path, not a
+      # workaround, so there is nothing to harden here.
+      containers:
+        - name: agent
+          image: nousresearch/hermes-agent:v2026.8.3
+          # args, not command: compose's `command:` replaces CMD and leaves
+          # ENTRYPOINT alone. Overriding the entrypoint skips the root drop.
+          args: ["gateway", "run"]
+          ports:
+            - name: gateway
+              containerPort: 8642
+            - name: dashboard
+              containerPort: 9119
+          env:
+            - name: TZ
+              value: America/Los_Angeles
+            - name: HERMES_UID
+              value: "1000"
+            - name: HERMES_GID
+              value: "1000"
+            # Pinned, not inherited. This is the image's current default, so
+            # setting it changes nothing today and keeps an image update from
+            # moving the agent's write gate somewhere this repo never mounted.
+            - name: HERMES_WRITE_SAFE_ROOT
+              value: /opt/data
+            - name: HERMES_DASHBOARD
+              value: "1"
+            - name: HERMES_DASHBOARD_HOST
+              value: 0.0.0.0
+            - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef: { name: hermes, key: dashboard-username }
+            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: hermes, key: dashboard-password }
+            - name: HERMES_DASHBOARD_BASIC_AUTH_SECRET
+              valueFrom:
+                secretKeyRef: { name: hermes, key: dashboard-secret }
+            # 8642 is unauthenticated in plain `gateway run`. VERIFY these
+            # engage before trusting hermes-api: an unkeyed request must be
+            # refused, or that Ingress is an open agent API on the tailnet.
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 0.0.0.0
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef: { name: hermes, key: api-server-key }
+            - name: GATEWAY_MULTIPLEX_PROFILES
+              value: "true"  # container_boot reads multiplex from env only, not config.yaml
+          volumeMounts:
+            - name: nfs
+              mountPath: /opt/data
+            - name: dshm
+              mountPath: /dev/shm
+          # TCP, not the compose GET /api/status: dashboard auth engages on a
+          # non-loopback bind, so an unauthenticated probe takes a 401 and loops.
+          startupProbe:
+            tcpSocket:
+              port: dashboard
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: dashboard
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+        # Web edge: *.hermes.lab.cheyn.net from /opt/data/Caddyfile, which also
+        # holds the auth gate. Shares the pod, so it proxies localhost:8642.
+        - name: caddy
+          image: caddy:2.9-alpine
+          args: ["caddy", "run", "--config", "/opt/data/Caddyfile", "--adapter", "caddyfile"]
+          ports:
+            - name: web
+              containerPort: 8080
+          env:
+            # Key injected on the /api proxy hop; never reaches a browser.
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef: { name: hermes, key: api-server-key }
+          volumeMounts:
+            - name: nfs
+              mountPath: /opt/data
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+          # No probe: a bad Caddyfile should 502 the sites, not evict the pod.
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: nfs
+          persistentVolumeClaim:
+            claimName: hermes-nfs
+        - name: dshm
+          emptyDir: # compose shm_size: 1g, for the agent's browser tooling
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: caddy-data
+          emptyDir: {}
+---
+# Keeps the agent image in every worker's containerd store. Measured: pulling
+# it during a failover cost 111s of a 218s recovery. The tag here must match
+# the Deployment's above, or a failover silently pulls again.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hermes-image-prepull
+  namespace: hermes
+spec:
+  selector:
+    matchLabels:
+      app: hermes-image-prepull
+  template:
+    metadata:
+      labels:
+        app: hermes-image-prepull
+    spec:
+      initContainers:
+        - name: pull
+          image: nousresearch/hermes-agent:v2026.8.3
+          command: ["/bin/true"]
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes
+  namespace: hermes
+spec:
+  type: ClusterIP
+  selector:
+    app: hermes
+  ports:
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
+    - name: gateway
+      port: 8642
+      targetPort: gateway
+    - name: web
+      port: 8080
+      targetPort: web
+---
+# One hostname, two ports. No secretName: Traefik serves the default cert from
+# its TLSStore on both entrypoints. The API server (8642) and dashboard (9119)
+# share hermes.lab.cheyn.net, split by port, because the Android app has no
+# separate dashboard-host field and resolves the two by port or path prefix.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes-dashboard
+  namespace: hermes
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - hermes.lab.cheyn.net
+  rules:
+    - host: hermes.lab.cheyn.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hermes
+                port:
+                  name: dashboard
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes-api
+  namespace: hermes
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure-api
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - hermes.lab.cheyn.net
+  rules:
+    - host: hermes.lab.cheyn.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hermes
+                port:
+                  name: gateway

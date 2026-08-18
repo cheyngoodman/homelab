@@ -1,0 +1,39 @@
+# In kube-system because Traefik's default TLSStore reads the Secret from its
+# own namespace. A wildcard covers one label, so keep names one level deep.
+
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-lab-cheyn-net
+  namespace: kube-system
+spec:
+  secretName: wildcard-lab-cheyn-net-tls
+
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+
+  dnsNames:
+    - "*.lab.cheyn.net"
+    # Not covered by the wildcard; listed so lab.cheyn.net itself can be
+    # served.
+    - "lab.cheyn.net"
+---
+# Traefik's default certificate: served for any route that requests TLS
+# without naming a secret, which saves copying the wildcard into every
+# namespace. Must be named `default` and live in Traefik's namespace. Until
+# the Certificate above is READY, Traefik falls back to its self-signed cert
+# browsers warn, nothing is broken.
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: kube-system
+spec:
+  defaultCertificate:
+    secretName: wildcard-lab-cheyn-net-tls

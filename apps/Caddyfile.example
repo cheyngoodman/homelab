@@ -1,0 +1,48 @@
+# Reference only. The live file is /opt/data/Caddyfile on NFS and is never
+# committed, so the running site list stays out of git.
+#
+# Validating, reloading and hashing a password: HERMES.md#caddyfile.
+
+{
+	auto_https off # Traefik terminates TLS
+	admin localhost:2019
+}
+
+# Catch-all. The Ingress sends every name under *.hermes.lab.cheyn.net here,
+# and without this Caddy answers the unnamed ones with an empty 200, so a typo
+# looks like a working site. Named blocks below still win.
+:8080 {
+	respond "not found" 404
+}
+
+# The only gate. bcrypt only: an apr1 hash parses fine, then rejects every
+# login. Generate with `caddy hash-password`.
+(auth) {
+	basic_auth {
+		<user> <bcrypt-hash>
+	}
+}
+
+# Static files. Without `import auth` the site is public.
+http://<app>.hermes.lab.cheyn.net:8080 {
+	import auth
+	root * /opt/data/<app>
+	file_server
+}
+
+# Same, plus a browser door to the Gateway API (HERMES.md). The key is attached
+# here so the page never holds it; Origin is stripped so the API server's CORS
+# check needs no knowledge of this hostname.
+http://<app2>.hermes.lab.cheyn.net:8080 {
+	import auth
+	root * /opt/data/web/<app2>
+	file_server
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8642 {
+			header_up Authorization "Bearer {env.API_SERVER_KEY}"
+			header_up Origin ""
+			flush_interval -1 # stream, don't buffer
+		}
+	}
+}

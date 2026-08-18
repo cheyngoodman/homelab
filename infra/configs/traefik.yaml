@@ -1,0 +1,46 @@
+# k3s reconciles its bundled Traefik HelmChart, so editing the Service or the
+# chart directly silently reverts. This HelmChartConfig is the override.
+
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    service:
+      annotations:
+        # Request a specific address. The `spec.loadBalancerIP` field this
+        # replaces is deprecated upstream.
+        # Changing this means changing the EdgeRouter dnsmasq line too.
+        metallb.io/loadBalancerIPs: 10.0.0.51
+
+    ports:
+      web:
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+
+      # The API server (8642) on the same hostname, split by port. The Android
+      # app is a one-host two-port model (gateway on `port`, dashboard on
+      # `dashboardPortOverride`), so give 8642 its own TLS entrypoint instead of
+      # a second hostname.
+      websecure-api:
+        port: 8642
+        expose:
+          default: true
+        exposedPort: 8642
+        protocol: TCP
+        http:
+          tls:
+            enabled: true
+
+    providers:
+      kubernetesIngress:
+        publishedService:
+          # Writes the LB address into each Ingress's status, so
+          # `kubectl get ingress` shows an ADDRESS instead of a blank column.
+          enabled: true

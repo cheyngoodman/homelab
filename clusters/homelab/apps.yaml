@@ -1,0 +1,23 @@
+# Applications. Depends on infra-configs (ingress working), not
+# infra-tls; apps serve immediately and pick up the real certificate the
+# moment it issues.
+
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infra-configs
+  interval: 10m
+  retryInterval: 2m
+  # 5m expired on a cold rebuild: four pods pull the same ~1GB agent image at
+  # once, so the health check timed out on a build that was fine.
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./apps
+  prune: true
+  wait: true

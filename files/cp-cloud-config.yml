@@ -1,0 +1,171 @@
+#cloud-config
+# k3s control-plane bootstrap
+#
+# Template variables (rendered by Terraform templatefile()). This list is the
+# whole interface; anything not here is not passed. Every name below is written
+# $${...}, the templatefile() escape for a literal, because a bare $${...} in a
+# comment is a real interpolation: it renders, and a multi-line value lands at
+# column 0 as top-level YAML. Same hazard as a bare %%{...} in a comment.
+#   $${hostname}:            e.g. k3s-cp-1
+#   $${ip}:                  e.g. 10.0.0.16
+#   $${token}:               pre-generated k3s cluster token
+#   $${server_url}:          empty for cp-1 (first server), "https://10.0.0.16:6443" for cp-2/3
+#   $${ssh_key}:             SSH public key
+#   $${k3s_version}:         exact k3s release, never a channel
+#   $${bootstrap_manifests}: the Secrets, or empty to seed none
+
+hostname: ${hostname}
+fqdn: ${hostname}.internal
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_key}
+    lock_passwd: true
+
+# Deliberately NOT package_upgrade. A dist-upgrade at first boot pulls a
+# different package set every day, which is the same reproducibility hole as
+# an unpinned k3s, and it is most of the build time. Image updates come from
+# bumping ubuntu_codename and rebuilding templates.
+package_update: true
+package_upgrade: false
+
+packages:
+  - qemu-guest-agent
+  - curl
+  - avahi-daemon # advertise ${hostname}.local over mDNS
+  - libnss-mdns  # ...and resolve other .local names from this node
+  - nfs-common   # mount the QNAP /k8s export for etcd snapshots
+
+# QNAP /k8s export. nofail is load-bearing: a down NAS must cost snapshots,
+# never a boot, the whole point of node-local root disks (NETWORK.md).
+mounts:
+  - ["10.0.0.10:/k8s", /mnt/qnap-k8s, nfs, "nofail,_netdev,rw,noatime", "0", "2"]
+
+write_files:
+  - path: /etc/rancher/k3s/config.yaml
+    permissions: "0600"
+    content: |
+      token: "${token}"
+      disable: servicelb
+%{ if server_url == "" ~}
+      cluster-init: true
+%{ endif ~}
+      node-ip: ${ip}
+%{ if server_url != "" ~}
+      server: ${server_url}
+%{ endif ~}
+      # Keep workloads off the etcd nodes. key:effect with no value is valid
+      # k3s taint syntax. Lives here, not in a kubectl one-liner, because only
+      # config in cloud-init survives a node rebuild.
+      node-taint:
+        - "node-role.kubernetes.io/control-plane:NoSchedule"
+      # Future API VIP (.50, reserved in the NETWORK.md address plan). Baked in
+      # now so the serving cert is already valid for the VIP when kube-vip
+      # lands; adding a SAN later means touching every server node again.
+      tls-san:
+        - "10.0.0.50"
+
+  # etcd snapshots -> NAS
+  # A drop-in rather than more keys in config.yaml above, so the identical
+  # file can be placed on an already-running node without touching the main
+  # config. Snapshots on node-local disk protect nothing on a cluster that
+  # treats node-local disk as expendable.
+  - path: /etc/rancher/k3s/config.yaml.d/20-etcd-snapshots.yaml
+    permissions: "0600"
+    content: |
+      etcd-snapshot-dir: /mnt/qnap-k8s/etcd-snapshots
+      etcd-snapshot-retention: 20
+
+  # Flux bootstrap seed
+  # k3s applies everything in its manifests directory continuously and retries
+  # failures, so the FluxInstance below lands as soon as the operator's CRD
+  # exists; no ordering to manage. Two files, one job each: install the
+  # operator, declare the instance. Everything past this seed is pulled from
+  # git by Flux itself (clusters/homelab in this codebase).
+%{ if bootstrap_manifests != "" ~}
+  # Credentials that cannot ride in git, delivered the same way Flux itself is:
+  # k3s applies anything in this directory and retries until it takes. Nothing
+  # is left out of band, which is what makes a rebuild need no kubectl. 0600
+  # because it is plaintext at rest on the node, as the k3s token above is.
+  - path: /var/lib/rancher/k3s/server/manifests/bootstrap-secrets.yaml
+    permissions: "0600"
+    content: |
+      ${indent(6, bootstrap_manifests)}
+%{ endif ~}
+  - path: /var/lib/rancher/k3s/server/manifests/flux-operator.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: flux-system
+      ---
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChart
+      metadata:
+        name: flux-operator
+        namespace: kube-system
+      spec:
+        chart: oci://ghcr.io/controlplaneio-fluxcd/charts/flux-operator
+        version: 0.58.0
+        targetNamespace: flux-system
+  - path: /var/lib/rancher/k3s/server/manifests/flux-instance.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: fluxcd.controlplane.io/v1
+      kind: FluxInstance
+      metadata:
+        name: flux
+        namespace: flux-system
+      spec:
+        distribution:
+          # Exact, never a channel. "2.9.x" here was the one range left in the
+          # codebase, and it is the shape the version policy forbids by name: two
+          # control planes seeded a week apart come up on different patch
+          # releases. The field is a semver expression, so a bare version is
+          # the expression that matches only itself.
+          version: "2.9.4"
+          registry: "ghcr.io/fluxcd"
+        sync:
+          kind: GitRepository
+          url: "ssh://git@github.com/cheyngoodman/homelab.git"
+          ref: "refs/heads/main"
+          path: "clusters/homelab"
+          pullSecret: "flux-system"
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  # Pin mDNS to the LAN NIC. Left unrestricted, avahi also publishes on the
+  # k3s CNI/flannel/veth interfaces, so ${hostname}.local would resolve to a
+  # pod-network IP as often as ${ip}, and every pod churn spams the log.
+  - LAN_NIC=$(ip -o -4 route show default | awk '{print $5}' | head -1); sed -i "s/^#*allow-interfaces=.*/allow-interfaces=$LAN_NIC/" /etc/avahi/avahi-daemon.conf
+  - systemctl enable --now avahi-daemon
+  - systemctl restart avahi-daemon
+  # The mounts module wrote fstab before nfs-common was installed; pick the
+  # mount up now that it is. || true; nofail applies here too.
+  - mount -a || true
+  - mkdir -p /mnt/qnap-k8s/etcd-snapshots || true
+%{ if server_url == "" ~}
+  # Bootstrap node (cp-1): install first k3s server
+  - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${k3s_version}" INSTALL_K3S_EXEC="server --config /etc/rancher/k3s/config.yaml" sh -
+%{ else ~}
+  # Joining control-plane: wait for cp-1 then join
+  # Wait for cp-1's API to answer. Test for ANY HTTP response, not for the word
+  # "ok": /livez requires auth and returns 401, so `grep -q ok` could never
+  # match and every joining node burned the full 300s timeout before installing
+  # anyway. A 401 proves the API server is listening, which is all we need.
+  # %%{...} renders as a literal percent-brace sequence; doubling is the
+  # templatefile() escape. (Never write the undoubled form, even in a comment;
+  # it opens a real directive.)
+  - for i in $(seq 1 30); do if [ "$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 ${server_url}/livez 2>/dev/null)" != "000" ]; then break; fi; sleep 10; done
+  - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${k3s_version}" INSTALL_K3S_EXEC="server --config /etc/rancher/k3s/config.yaml" sh -
+%{ endif ~}
+
+power_state:
+  mode: reboot
+  message: "Cloud-init complete; rebooting"
+  timeout: 60

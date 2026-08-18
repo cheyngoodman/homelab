@@ -1,0 +1,94 @@
+# Offline validation of everything that can be checked without touching the
+# cluster. "The rendered YAML parses" and "the node will boot" are different
+# claims, and only the first one is free, so it runs on every push.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  secrets:
+    name: No secret files tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nothing secret-shaped is in git
+        # .gitignore already covers these; this fails the build if someone
+        # force-adds one anyway. The repo is meant to go public, and
+        # terraform.tfvars now carries three bootstrap credentials, so an
+        # accidental commit is the one mistake here with no undo.
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)(terraform\.tfvars(\.json)?|\.env)$|\.auto\.tfvars(\.json)?$|\.tfstate($|\.)|\.(pem|key)$' || true)
+          if [ -n "$bad" ]; then echo "tracked secret-shaped files:"; echo "$bad"; exit 1; fi
+          echo "clean"
+
+  tofu:
+    name: OpenTofu validate + render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+
+      - name: Check formatting
+        run: tofu fmt -check -recursive -diff .
+
+      - name: Validate main config
+        # The provider block reads an SSH key at parse time; any key satisfies
+        # validate, which never contacts Proxmox.
+        run: |
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
+          tofu init -backend=false -input=false
+          tofu validate
+
+      - name: Render cloud-init templates
+        run: |
+          cd tests/render
+          tofu init -backend=false -input=false
+          tofu validate
+          tofu apply -auto-approve
+          for o in rendered_cp_first rendered_cp_first_no_secrets rendered_cp_join rendered_worker; do
+            tofu output -raw "$o" > "$o.yml"
+          done
+
+      - name: cloud-init schema check
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq cloud-init
+          cd tests/render
+          for f in rendered_*.yml; do
+            echo "== $f"
+            cloud-init schema --config-file "$f"
+          done
+
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: kubeconform
+        # CRD schemas come from the datree catalog; anything not there
+        # (helm.cattle.io) is skipped rather than failed. values.yaml files
+        # are Helm values, not manifests, so they are excluded.
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          find infra clusters apps -name '*.yaml' ! -name 'values.yaml' ! -name 'kustomization.yaml' -print0 | xargs -0 ./kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-missing-schemas
+
+      - name: Build kustomizations
+        # The check above reads files one at a time, so it cannot see a
+        # kustomization.yaml that names a file which is not there: every file
+        # is valid, the overlay is broken, and it only fails in the cluster.
+        # Building each directory is what Flux does with it.
+        run: |
+          curl -sSL 'https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz' | tar xz kustomize
+          for d in apps infra/controllers infra/configs infra/tls; do
+            echo "== $d"
+            ./kustomize build "$d" | ./kubeconform -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              -ignore-missing-schemas
+          done

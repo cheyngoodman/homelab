@@ -1,0 +1,10 @@
+apiVersion: tailscale.com/v1alpha1
+kind: Connector
+metadata:
+  name: lan
+spec:
+  hostname: lab-subnet-router
+  replicas: 1
+  subnetRouter:
+    advertiseRoutes:
+      - 10.0.0.0/24
