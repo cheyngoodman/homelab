@@ -14,7 +14,7 @@ jobs:
     name: No secret files tracked
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Nothing secret-shaped is in git
         # .gitignore already covers these; this fails the build if someone
         # force-adds one anyway. The repo is meant to go public, and
@@ -29,9 +29,8 @@ jobs:
     name: OpenTofu validate + render
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: opentofu/setup-opentofu@v1
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1.0.8
       - name: Check formatting
         run: tofu fmt -check -recursive -diff .
 
@@ -66,7 +65,7 @@ jobs:
     name: Kubernetes manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: kubeconform
         # CRD schemas come from the datree catalog; anything not there
         # (helm.cattle.io) is skipped rather than failed. values.yaml files
